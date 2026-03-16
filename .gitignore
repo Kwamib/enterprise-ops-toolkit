@@ -1,0 +1,5 @@
+.env
+*.pem
+*.log
+*.dmp
+*.tar.gz
