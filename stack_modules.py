@@ -187,7 +187,7 @@ def logging_func(**kwargs):
 
 		log_str = kwargs.get("log_str")
 		lt = kwargs.get("lt")
-		TS = time.strftime("%d-%m-%y %H:%M:%S", time.localtime())
+		TS = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 		if lt == "INFO":
 			logger.info("{} - {}".format(TS, log_str))
@@ -223,7 +223,7 @@ def stack_emails(**kwargs):
 		BODY = kwargs.get("BODY")
 
 		TIME_RUN = time.localtime()
-		TS = time.strftime("%m%d%y%H%S", TIME_RUN)
+		TS = time.strftime("%Y-%m-%d %H:%M:%S", TIME_RUN)
 		logging_func(logger=logger, log_str="Stack emails module runtime is: {}\n".format(TS), lt="INFO")
 
 		FROM = SMTP_FROM
@@ -297,7 +297,7 @@ def database_backup(**kwargs):
 		elif isinstance(SCHEMAS, list):
 			SCHEMAS = [schema.strip() for schema in SCHEMAS]
 
-		TS = datetime.datetime.now().strftime("%m%d%H%M%S")
+		TS = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
 		# Loop through each schema
 		for SCHEMA in SCHEMAS:
@@ -450,7 +450,7 @@ def G_Zipp(**kwargs):
 			if not os.path.exists(file):
 				raise FileNotFoundError("[ERROR] The file '{}' does not exist.".format(file))
 
-		TS = datetime.datetime.now().strftime("%m%d%H%M%S")
+		TS = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
 		# Case 1: Multiple files or directory → .tar.gz
 		if len(FILES) > 1 or os.path.isdir(FILES[0]):
@@ -581,7 +581,7 @@ def database_import(**kwargs):
 				continue
 
 			# Generate import parameter file
-			TS = datetime.datetime.now().strftime("%m%d%H%M%S")
+			TS = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
 			LOGFILE = "impdp_{}_{}_{}.log".format(SCHEMA, RUNNER, TS)
 			LOGFILE_PATH = os.path.join(BASE_DIR, LOGFILE)
