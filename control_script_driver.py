@@ -78,7 +78,7 @@ def usage():
 
 # Defining Timestamp Global Variables
 timestring = time.localtime()
-TS = time.strftime("%m%d%y%H%M%S", timestring)
+TS = time.strftime("%Y%m%d%H%M%S", timestring)
 
 if __name__ == "__main__":
 	if len(sys.argv) < 2:

@@ -5,3 +5,4 @@
 *.tar.gz
 *.env
 *.key
+__pycache__/

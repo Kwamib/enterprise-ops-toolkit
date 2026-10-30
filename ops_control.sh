@@ -6,11 +6,10 @@
 #              secure file transfer, and database migration.
 # Author: Mayowa Babatola
 #
-# NOTE ON `set -e`: deliberately NOT enabled. This script relies on commands
-# failing and being handled inline (the grep conditionals in particular), so
-# `set -e` would abort runs that are working as designed. `set -u` is likewise
-# left off because several variables are intentionally optional. Correctness
-# here comes from explicit checks, not from shell options.
+# NOTE ON `set -e`: not enabled. Each step checks its own result and records
+# FAILED in the audit log before returning; `set -e` would exit first and leave
+# the audit row at PROCESSING. `set -u` is off because several settings are
+# optional and are checked where they are used.
 # =============================================================================
 
 # ---------------------------------------------------------
@@ -19,7 +18,9 @@
 SCRIPTS="${SCRIPTS_DIR:-/opt/scripts}"
 DB_NAME="${DB_NAME:-MYDB}"
 AVAIL=$(ps -ef | grep pmon | grep "${DB_NAME}" | awk '{print $8}' | cut -d "_" -f 3)
-TS=$(date "+%m%d%Y%M%S")
+# Timestamps are YYYYMMDDHHMMSS: sortable, unique to the second, and digits
+# only, because file names built from them are split on "_" later.
+TS=$(date "+%Y%m%d%H%M%S")
 SCRIPT_HOME="${SCRIPT_HOME:-/opt/scripts/bin}"
 HOST="${REMOTE_HOST}"
 USER="${REMOTE_USER:-oracle}"
@@ -28,9 +29,7 @@ MAIL="${ALERT_EMAIL}"
 LOG_DIR="${LOG_DIR:-/backup/datapump/${DB_NAME}}"
 DB_SCHEMA_PREFIX="${DB_SCHEMA_PREFIX:-OPS}"
 
-# CHANGED: disk threshold is now one configurable value instead of a literal
-# buried in a comparison. The old code compared against 82 while every message
-# said 80%, so alerts described a threshold the script did not actually use.
+# Alert threshold, in percent. The check and every alert message use it.
 DISK_THRESHOLD="${DISK_THRESHOLD:-80}"
 
 # Colors for Output
@@ -44,9 +43,8 @@ print_green() { echo -e "${GREEN}$1${RESET}"; }
 print_red() { echo -e "${RED}$1${RESET}"; }
 print_cyan() { echo -e "${CYAN}$1${RESET}"; }
 
-# CHANGED: new helper. $RANDOM is 0-32767, so operation IDs collided often
-# enough to corrupt the audit trail - a rerun could overwrite an earlier run's
-# row. Epoch seconds plus PID is unique for any realistic run rate.
+# Operation IDs: epoch seconds plus PID, unique for any realistic run rate.
+# ($RANDOM only goes to 32767, so IDs collided.)
 new_op_id() {
 	echo "$(date +%s)$$"
 }
@@ -99,11 +97,8 @@ email() {
 # ---------------------------------------------------------
 # Disk Utilization Monitoring
 # ---------------------------------------------------------
-# CHANGED: this function no longer calls `exit`. It is invoked from inside
-# backup() and database_backup(), so an exit here killed the entire script
-# mid-operation - leaving the audit row stuck in PROCESSING forever, because
-# the COMPLETE/FAILED update never ran. It now returns a status and each
-# caller decides what to do, which is how a check should behave.
+# Returns a status instead of exiting: callers are mid-operation and still
+# need to record COMPLETE or FAILED for the audit row.
 disk_utilization() {
 	local MOUNT_POINT=$1
 
@@ -118,8 +113,6 @@ disk_utilization() {
 
 	print_cyan "\n[STATUS] Current utilization for ${MOUNT_POINT} is ${UTILIZATION}%\n"
 
-	# CHANGED: threshold and message now reference the same value, so the alert
-	# text can never drift from the condition that produced it.
 	if [[ ${UTILIZATION} -gt ${DISK_THRESHOLD} ]]; then
 		print_red "\n[WARNING] Disk usage on ${MOUNT_POINT} exceeded ${DISK_THRESHOLD}%! Current: ${UTILIZATION}%"
 		SUBJECT="[WARNING] Disk usage on ${MOUNT_POINT} exceeded ${DISK_THRESHOLD}% threshold. Current usage: ${UTILIZATION}%"
@@ -137,10 +130,7 @@ disk_utilization() {
 # ---------------------------------------------------------
 # File/Directory Backup Function
 # ---------------------------------------------------------
-# CHANGED: reads its own arguments. It was called as
-# `backup "$SOURCE" "$RUNNER" "$DESTINATION"` but ignored all three and used
-# globals instead - it worked only because the globals happened to hold the
-# same values. That is a coincidence, not a contract.
+# Usage: backup SOURCE RUNNER DESTINATION
 backup() {
 	local SOURCE="${1:?source required}"
 	local RUNNER="${2:?runner required}"
@@ -158,23 +148,20 @@ backup() {
 	echo "$border"
 	echo -e "\n|| [INFO] -> Checking disk utilization for ${MOUNT_POINT} before starting the backup... ||\n"
 
-	# CHANGED: the caller now handles a failed disk check explicitly.
 	disk_utilization "${MOUNT_POINT}" || {
 		print_red "\n[ERROR] Disk check failed for ${MOUNT_POINT}. Backup aborted.\n"
 		return 1
 	}
 	echo "$border"
 
-	TS=$(date "+%m%d%Y%M%S")
+	TS=$(date "+%Y%m%d%H%M%S")
 	print_cyan "\n[INFO] Backing up SOURCE: ${SOURCE} TO DESTINATION: ${DESTINATION}\n"
 
 	IFS=' ' read -r -a SOURCE_ARRAY <<< "${SOURCE}"
 
 	database_logging "$OP_ID" "$OP_TYPE" "PROCESSING"
 
-	# CHANGED: loop variable renamed from SOURCE to ITEM. The old loop reassigned
-	# SOURCE on every pass, so the success message afterwards reported only the
-	# last path processed, not what was actually requested.
+	# ITEM, not SOURCE, so the summary afterwards reports what was requested.
 	for ITEM in "${SOURCE_ARRAY[@]}"; do
 		if [[ -f "${ITEM}" ]]; then
 			BACKUP_TYPE="file_backup"
@@ -184,8 +171,7 @@ backup() {
 			print_green "\n[INFO] ${ITEM} is a directory\n"
 		else
 			print_red "\n[ERROR] The source: ${ITEM} is neither a file nor a directory. Backup aborted!\n"
-			# CHANGED: mark the operation FAILED before leaving. The old code
-			# exited here with the row still reading PROCESSING.
+			# Record FAILED before returning, so the audit row never stays PROCESSING.
 			database_logging "$OP_ID" "$OP_TYPE" "FAILED"
 			return 1
 		fi
@@ -238,8 +224,8 @@ database_logging() {
 	local STATUS="$3"
 
 	local TS
-	TS=$(date "+%m-%d-%y %H:%M:%S")
-	LOG_TS=$(date "+%m%d%y%H%S")
+	TS=$(date "+%Y-%m-%d %H:%M:%S")
+	LOG_TS=$(date "+%Y%m%d%H%M%S")
 
 	local LOGDIR="${SCRIPT_HOME}/logs/${LOG_TS}"
 	local LOG_FILE="${LOGDIR}/dblogin_${LOG_TS}.log"
@@ -248,18 +234,16 @@ database_logging() {
 
 	print_cyan "\n[INFO] Log file created at: ${LOG_FILE}\n"
 
+	# shellcheck source=/dev/null  # per-database environment file, path set at run time
 	source "${SCRIPTS}/oracle_env_${DB_NAME}.sh"
 
 	echo "[INFO] Logging Operation: OP_ID=${OP_ID}, OP_TYPE=${OP_TYPE}, STATUS=${STATUS}, TIMESTAMP=${TS}"
 
-	# CHANGED: capture sqlplus's exit status directly. The old code ran a
-	# `print_cyan` between the heredoc and its `if (($? != 0))` check, so $?
-	# reported the echo's status, not sqlplus's - the check never fired.
+	# Check sqlplus's status straight away: any command in between replaces $?.
 	local rc=0
 
 	if [[ "${STATUS}" == "PROCESSING" ]]; then
-		# CHANGED: named columns instead of positional VALUES. An unqualified
-		# INSERT breaks silently the moment a column is added to the table.
+		# Named columns, so adding a column to the table can't break this INSERT.
 		sqlplus -s "/as sysdba" <<EOF
 		set linesize 250
 		WHENEVER SQLERROR EXIT FAILURE
@@ -275,9 +259,6 @@ EOF
 		local END_TS
 		END_TS=$(date "+%Y-%m-%d %H:%M:%S")
 
-		# CHANGED: removed `sleep 10`. It delayed every status update by ten
-		# seconds with no stated reason and no condition being waited on.
-
 		echo "[INFO] Updating operation ID ${OP_ID} to STATUS=${STATUS} with END_TIME=${END_TS}"
 
 		sqlplus -s "/as sysdba" <<EOF
@@ -292,9 +273,8 @@ EOF
 		rc=$?
 	fi
 
-	# CHANGED: a logging failure warns but does not kill the caller. The old
-	# bare `exit` aborted an in-flight backup because the audit write failed,
-	# which is the wrong trade - losing the data matters more than losing the row.
+	# A logging failure warns but doesn't stop the caller: the backup matters
+	# more than its audit row.
 	if (( rc != 0 )); then
 		print_red "\n[ERROR] Database logging failed for OP_ID=${OP_ID} (status ${STATUS})."
 		return 1
@@ -307,7 +287,6 @@ EOF
 # ---------------------------------------------------------
 # Oracle Database Backup (Data Pump Export)
 # ---------------------------------------------------------
-# CHANGED: reads its own arguments. It was called with three and used none.
 database_backup() {
 	local SCHEMA="${1:?schema required}"
 	local RUNNER="${2:?runner required}"
@@ -319,7 +298,7 @@ database_backup() {
 	local OP_TYPE="DATABASE_BACKUP"
 	local LOG_FILE
 	local TS
-	TS=$(date "+%m%d%Y%M%S")
+	TS=$(date "+%Y%m%d%H%M%S")
 
 	print_cyan "\n[INFO] Backing up SCHEMA: ${SCHEMA}\n"
 
@@ -344,14 +323,12 @@ database_backup() {
 	fi
 
 	print_cyan "\n[INFO] Pointing to ${AVAIL} database\n"
+	# shellcheck source=/dev/null  # per-database environment file, path set at run time
 	source "${SCRIPTS}/oracle_env_${DB_NAME}.sh"
 
 	print_cyan "\n[INFO] The ${AVAIL} Database is up and running, checking for DB status."
 
-	# CHANGED: status file is written to and read from the same path. The old
-	# code wrote to ./check_db_status.log (current directory, whatever that
-	# happened to be) and grepped ${SCRIPT_HOME}/check_db_status.log - so the
-	# check either read a stale file or found nothing.
+	# Written and read at the same absolute path, wherever the script runs from.
 	local STATUS_LOG="${SCRIPT_HOME}/check_db_status.log"
 
 	sqlplus -s "${DB_CONNECT_STRING}" > "${STATUS_LOG}" <<EOF
@@ -371,9 +348,7 @@ EOF
 
 	database_logging "$OP_ID" "$OP_TYPE" "PROCESSING"
 
-	# CHANGED: filenames computed once and reused. The old code rebuilt the
-	# same expdp_SCHEMA_RUNNER_TS string in five places, which is how the tar
-	# ended up referencing a variable that was never set.
+	# Names are built once and reused below.
 	local BASENAME="expdp_${SCHEMA}_${RUNNER}_${TS}"
 	local PAR_FILE="${BASENAME}.par"
 	local DUMP_FILE="${BASENAME}.dmp"
@@ -389,8 +364,6 @@ EOF
 
 	print_cyan "\n[INFO] Running database backup ... please standby!\n"
 
-	# CHANGED: dropped the bare `wait`. expdp runs in the foreground here, so
-	# there was no background job to wait on.
 	expdp parfile="${PAR_FILE}" | tee -a "${LOG_FILE}"
 
 	if ! grep -q "successfully completed" "${LOG_FILE}"; then
@@ -413,17 +386,11 @@ EOF
 
 	print_cyan "\n[INFO] Compressing dump and log files to ${BACKUP_ARCHIVE}...\n"
 
-	# CHANGED, two bugs in one line:
-	#   1. `tar -cvf` produced an UNCOMPRESSED archive named .tar.gz. Every
-	#      downstream `tar -xzf` on it would fail. Now -czf.
-	#   2. It archived "${DUMPFILE_NAME}", a variable never assigned anywhere
-	#      in this function - so the tar contained nothing, and the `find ... rm`
-	#      chained after it then deleted the real dump files. That combination
-	#      destroyed the backup it had just taken.
+	# -z makes a real gzip archive, which later steps open with tar -xzf.
+	# The dump and its log are archived by name.
 	if tar -czf "${BACKUP_ARCHIVE}" -C "${LOG_DIR}" "${DUMP_FILE}" "${BASENAME}.log"; then
 		print_green "\n[INFO] Backup archive created successfully: ${BACKUP_ARCHIVE}\n"
-		# CHANGED: originals are removed only after the archive is confirmed
-		# written, and only the files that were archived.
+		# Remove the originals only after the archive is written, and only those.
 		rm -f "${LOG_DIR}/${DUMP_FILE}" "${LOG_DIR}/${BASENAME}.log"
 	else
 		print_red "\n[ERROR] Failed to create archive. Dump files left in place.\n"
@@ -444,29 +411,21 @@ EOF
 # ---------------------------------------------------------
 # Check and Drop Schema If Exists
 # ---------------------------------------------------------
-# CHANGED: takes the schema name as a real argument instead of rebuilding it
-# from globals. The old version accepted $1, never used it, and referenced
-# ${SCHEMA}_${RUNNER}_NEW from the enclosing scope.
+# Takes the schema name as its argument.
 drop_schema_if_exists() {
 	local TARGET_SCHEMA="${1:?target schema required}"
 
 	print_cyan "\n[INFO] Check if ${TARGET_SCHEMA} exists in Database...\n"
 
-	# CHANGED: redirection moved before the heredoc. `<<EOF > file` is valid but
-	# reads as though the heredoc is being redirected; `> file <<EOF` is the
-	# conventional order and less likely to be misread during maintenance.
 	sqlplus -s / as sysdba > "${SCRIPT_HOME}/schema_check.log" <<EOF
 set heading off feedback off
 SELECT COUNT(*) FROM dba_users WHERE username = UPPER('${TARGET_SCHEMA}');
 EXIT;
 EOF
 
-	# CHANGED: dropped a useless-use-of-cat.
 	SCHEMA_EXISTS=$(tr -d '[:space:]' < "${SCRIPT_HOME}/schema_check.log")
 
-	# CHANGED: guard against a non-numeric result. If sqlplus errored, the old
-	# `-gt` comparison against arbitrary text produced a shell error and the
-	# function carried on as though the schema did not exist.
+	# sqlplus may print an error instead of a number; treat that as a failure.
 	if ! [[ "${SCHEMA_EXISTS}" =~ ^[0-9]+$ ]]; then
 		print_red "\n[ERROR] Could not determine whether ${TARGET_SCHEMA} exists. Aborting."
 		return 1
@@ -482,8 +441,6 @@ DROP USER ${TARGET_SCHEMA} CASCADE;
 EXIT;
 EOF
 
-		# CHANGED: $? is now checked immediately after sqlplus rather than after
-		# an intervening command.
 		if [[ $? -ne 0 ]]; then
 			print_red "\n[ERROR] Failed to drop ${TARGET_SCHEMA}"
 			return 1
@@ -508,9 +465,7 @@ cleanup() {
 
 	print_cyan "\n[INFO] Removing dump and log files for ${RUNNER}\n"
 
-	# CHANGED: operates on paths instead of cd'ing. A `cd` inside a function
-	# changes the working directory for everything that follows it in the same
-	# shell, which had already caused the check_db_status.log path mismatch.
+	# Works on full paths rather than cd, so the caller's directory is unchanged.
 	rm -f "${LOG_DIR}"/expdp_*_"${RUNNER}"_*.dmp "${LOG_DIR}"/expdp_*_"${RUNNER}"_*.log
 
 	print_green "\n[SUCCESS] Removed all dmp and logs for ${RUNNER} from ${LOG_DIR}.\n"
@@ -522,13 +477,11 @@ cleanup() {
 database_import() {
 	local IMPORT_TYPE="${1:?import type required}"
 	local RUNNER="${2:?runner required}"
-	# CHANGED: SCHEMA is now a parameter. The local-import branch referenced a
-	# global SCHEMA that the caller happened to set, so the function's behaviour
-	# depended on whatever the last loop iteration left behind.
+	# SCHEMA is a parameter, not a global left over from the caller's loop.
 	local SCHEMA="${3:-}"
 
 	local TS
-	TS=$(date "+%m%d%Y%H%M%S")
+	TS=$(date "+%Y%m%d%H%M%S")
 	local OP_ID
 	OP_ID=$(new_op_id)
 	local OP_TYPE="DATABASE_IMPORT"
@@ -541,9 +494,6 @@ database_import() {
 		return 1
 	fi
 
-	# CHANGED: removed a dead assignment. SOURCE was built from a timestamp
-	# generated moments earlier - which could never match a file on disk - and
-	# then immediately overwritten by the `ls -t` below.
 	local SOURCE
 	SOURCE=$(ls -t "${LOG_DIR}"/expdp_backup_"${RUNNER}"_*.tar.gz 2>/dev/null | head -n 1)
 
@@ -576,10 +526,9 @@ database_import() {
 
 		print_cyan "\n[INFO] Running impdp for all extracted dump files on the Cloud Server...\n"
 
-		# CHANGED: the remote block now tracks failures and exits non-zero if any
-		# schema fails. Previously it printed "[ERROR] failed to import" per
-		# schema and still returned success, so the local side logged COMPLETE
-		# for an import that had partially or entirely failed.
+		# The remote block counts failed schemas and exits non-zero if any failed,
+		# so the local side logs FAILED rather than COMPLETE.
+		# shellcheck disable=SC2087  # unquoted on purpose: local values fill in, remote ones are escaped with \$
 		ssh -i "${PEM_FILE}" "${USER}"@"${HOST}" bash <<EOF
 			set -o pipefail
 			DESTINATION="${DESTINATION}"
@@ -650,7 +599,7 @@ EOP
 			echo "[SUCCESS] All schemas imported."
 EOF
 
-		# CHANGED: the remote exit status now determines what gets logged.
+		# The remote exit status decides what gets logged.
 		if [[ $? -ne 0 ]]; then
 			print_red "\n[ERROR] One or more schemas failed to import on the Cloud Server.\n"
 			database_logging "$OP_ID" "$OP_TYPE" "FAILED"
@@ -670,16 +619,15 @@ EOF
 
 	print_cyan "\n[INFO] Running impdp locally for schema: ${SCHEMA}"
 
-	# CHANGED: extract the archive before importing. database_backup now removes
-	# the loose .dmp and .log files once the tar is verified, so the dump this
-	# import needs only exists inside ${SOURCE} until it is unpacked. The CLOUD
-	# branch above already extracts on the remote side; the local branch did not.
+	# database_backup removes the loose dump files once they're archived, so
+	# extract before importing. The CLOUD branch does this on the remote side.
 	print_cyan "\n[INFO] Extracting ${SOURCE} for local import...\n"
 	tar -xzf "${SOURCE}" -C "${LOG_DIR}" || {
 		print_red "\n[ERROR] Failed to extract ${SOURCE}\n"
 		return 1
 	}
 
+	# shellcheck source=/dev/null  # per-database environment file, path set at run time
 	source "${SCRIPTS}/oracle_env_${DB_NAME}.sh"
 
 	drop_schema_if_exists "${SCHEMA}_${RUNNER}_NEW" || {
@@ -703,9 +651,7 @@ EOF
 	local PARAM_FILE="impdp_${SCHEMA}_${RUNNER}_${TS}.par"
 	local LOG_FILE="${LOG_DIR}/impdp_${SCHEMA}_${RUNNER}_${TS}.log"
 
-	# CHANGED: LOG_FILE is set once. The old code assigned a bare filename, used
-	# it in the parameter file, then reassigned it to a full path afterwards -
-	# so impdp wrote its log somewhere other than where the script later looked.
+	# Set once, as a full path, so impdp logs where the script looks afterwards.
 	cat <<EOP > "${PARAM_FILE}"
 USERID='${DB_CONNECT_STRING}'
 SCHEMAS=${SCHEMA}
@@ -772,9 +718,8 @@ secure_copy() {
 
 	print_cyan "\n[INFO] Checking if the directory exists on the cloud server..."
 
-	# CHANGED: the remote mkdir now fails the function if it fails. The old
-	# `mkdir ... && echo SUCCESS || echo ERROR` printed an error and returned
-	# zero, so the scp that followed ran against a directory that did not exist.
+	# A failed remote mkdir fails the function, so scp never runs against a
+	# missing directory.
 	ssh -i "${PEM_FILE}" "${USER}"@"${HOST}" "mkdir -p '${CLOUD_DIR}'" || {
 		print_red "\n[ERROR] Failed to create ${CLOUD_DIR} on the cloud server!"
 		return 1
@@ -805,8 +750,7 @@ database_migration() {
 		return 1
 	fi
 
-	# CHANGED: capture the return status directly instead of testing $? after
-	# the call. Also passes SCHEMA through rather than relying on a global.
+	# Uses the call's own status, and passes SCHEMA through.
 	if ! database_import "${IMPORT_TYPE^^}" "${RUNNER^^}" "${SCHEMA}"; then
 		print_red "\n[ERROR] Database Migration failed for SCHEMA: ${SCHEMA}!"
 		return 1
@@ -815,10 +759,6 @@ database_migration() {
 	print_cyan "\n[INFO] Database migration for ${SCHEMA} completed successfully"
 	return 0
 }
-
-# CHANGED: removed aws_function() and its AWS) case branch entirely. It printed
-# a string and did nothing else - an unfinished placeholder in a toolkit that
-# otherwise does real work.
 
 # =========================================================
 # MAIN - Case Statement Router
@@ -886,11 +826,7 @@ DATABASE_BACKUP)
 		DESTINATION=$4
 	fi
 
-	# CHANGED: schemas are read from the argument directly. The old code piped
-	# ${SCHEMAS} into sqlplus as a SQL statement and spooled the result - meaning
-	# whatever the user typed at the prompt was executed as SQL against the
-	# database as sysdba. That is arbitrary SQL execution from an interactive
-	# prompt, and it is the most serious problem in the original file.
+	# Schema names come from the argument and are never sent to sqlplus as SQL.
 	read -r -a SCHEMA_ARRAY <<< "${SCHEMAS}"
 
 	failed=0
@@ -898,11 +834,6 @@ DATABASE_BACKUP)
 		[[ -z "${SCHEMA}" ]] && continue
 		database_backup "${SCHEMA^^}" "${RUNNER^^}" "${DESTINATION^^}" || failed=$((failed + 1))
 	done
-
-	# CHANGED: removed the trailing `cd "${LOG_DIR}"` and second tar. It
-	# referenced ${BACKUP_ARCHIVE}, a variable set inside database_backup's
-	# scope, and re-archived files that function had already archived and
-	# deleted - so it either failed or produced an empty archive.
 
 	if [[ ${failed} -gt 0 ]]; then
 		print_red "\n[ERROR] ${failed} schema(s) failed to back up.\n"
@@ -941,9 +872,7 @@ DATABASE_MIGRATION)
 		DESTINATION=$5
 	fi
 
-	# CHANGED: comparison is now case-insensitive. The old check tested the raw
-	# input against uppercase literals, so a user entering "cloud" was rejected
-	# while the error message displayed it uppercased - confusing and wrong.
+	# Case-insensitive, so "cloud" and "CLOUD" both work.
 	if [[ "${IMPORT_TYPE^^}" != "LOCAL" && "${IMPORT_TYPE^^}" != "CLOUD" ]]; then
 		print_red "\n[ERROR] Invalid import type: ${IMPORT_TYPE}. Choose LOCAL or CLOUD."
 		exit 1
@@ -953,9 +882,7 @@ DATABASE_MIGRATION)
 	print_cyan "Runner: ${RUNNER^^}"
 	print_cyan "Schemas: ${SCHEMAS^^}"
 
-	# CHANGED: calls the function directly instead of re-invoking the script via
-	# `$0 database_backup ...`. Spawning a subprocess meant the parent could not
-	# see any of the child's variables and had to guess at filenames afterwards.
+	# Called directly, not via $0, so this run's variables stay available.
 	read -r -a SCHEMA_ARRAY <<< "${SCHEMAS}"
 
 	for SCHEMA in "${SCHEMA_ARRAY[@]}"; do
@@ -1005,12 +932,7 @@ SECURE_COPY)
 
 	print_cyan "\n[INFO] Initializing secure copy......"
 
-	# CHANGED, two problems here:
-	#   1. secure_copy takes (SOURCE, DESTINATION), but was called with
-	#      (SOURCE, RUNNER, DESTINATION) - so RUNNER was used as the remote
-	#      path and files landed in a directory named after the operator.
-	#   2. The call sat INSIDE the else branch, so the interactive path
-	#      collected all three values and then did nothing with them.
+	# secure_copy takes SOURCE and DESTINATION only.
 	secure_copy "${SOURCE}" "${DESTINATION}" || exit 1
 	;;
 
@@ -1052,8 +974,7 @@ DISK_UTILIZATION)
 		MOUNT_POINT=$2
 	fi
 
-	# CHANGED: the function's return status now becomes the script's exit status,
-	# so this action is usable from cron or a monitoring wrapper that checks it.
+	# The action's status becomes the script's exit status, for cron and monitoring.
 	disk_utilization "${MOUNT_POINT}"
 	exit $?
 	;;
